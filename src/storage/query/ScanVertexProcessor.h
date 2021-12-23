@@ -16,8 +16,7 @@ namespace storage {
 
 extern ProcessorCounters kScanVertexCounters;
 
-class ScanVertexProcessor
-    : public QueryBaseProcessor<cpp2::ScanVertexRequest, cpp2::ScanVertexResponse> {
+class ScanVertexProcessor : public QueryBaseProcessor<cpp2::ScanVertexRequest, cpp2::ScanResponse> {
  public:
   static ScanVertexProcessor* instance(StorageEnv* env,
                                        const ProcessorCounters* counters = &kScanVertexCounters,
@@ -31,8 +30,7 @@ class ScanVertexProcessor
 
  private:
   ScanVertexProcessor(StorageEnv* env, const ProcessorCounters* counters, folly::Executor* executor)
-      : QueryBaseProcessor<cpp2::ScanVertexRequest, cpp2::ScanVertexResponse>(
-            env, counters, executor) {}
+      : QueryBaseProcessor<cpp2::ScanVertexRequest, cpp2::ScanResponse>(env, counters, executor) {}
 
   nebula::cpp2::ErrorCode checkAndBuildContexts(const cpp2::ScanVertexRequest& req) override;
 
@@ -40,14 +38,16 @@ class ScanVertexProcessor
 
   StoragePlan<Cursor> buildPlan(RuntimeContext* context,
                                 nebula::DataSet* result,
-                                std::unordered_map<PartitionID, cpp2::ScanCursor>* cursors);
+                                std::unordered_map<PartitionID, cpp2::ScanCursor>* cursors,
+                                StorageExpressionContext* expCtx);
 
   folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> runInExecutor(
       RuntimeContext* context,
       nebula::DataSet* result,
       std::unordered_map<PartitionID, cpp2::ScanCursor>* cursors,
       PartitionID partId,
-      Cursor cursor);
+      Cursor cursor,
+      StorageExpressionContext* expCtx);
 
   void runInSingleThread(const cpp2::ScanVertexRequest& req);
 
@@ -57,6 +57,7 @@ class ScanVertexProcessor
 
  private:
   std::vector<RuntimeContext> contexts_;
+  std::vector<StorageExpressionContext> expCtxs_;
   std::vector<nebula::DataSet> results_;
   std::vector<std::unordered_map<PartitionID, cpp2::ScanCursor>> cursorsOfPart_;
 

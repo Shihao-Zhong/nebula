@@ -272,6 +272,8 @@ class NebulaStore : public KVStore, public Handler {
                             PartitionID partId,
                             const std::vector<HostAddr>& remoteListeners) override;
 
+  void fetchDiskParts(SpaceDiskPartsMap& diskParts) override;
+
   nebula::cpp2::ErrorCode multiPutWithoutReplicator(GraphSpaceID spaceId,
                                                     std::vector<KV> keyValues) override;
 
@@ -282,6 +284,12 @@ class NebulaStore : public KVStore, public Handler {
                               std::vector<std::pair<GraphSpaceID, PartitionID>>& existParts);
 
   void unregisterOnNewPartAdded(const std::string& funcName) { onNewPartAdded_.erase(funcName); }
+
+  void registerBeforeRemoveSpace(std::function<void(GraphSpaceID)> func) {
+    beforeRemoveSpace_ = func;
+  }
+
+  void unregisterBeforeRemoveSpace() { beforeRemoveSpace_ = nullptr; }
 
  private:
   void loadPartFromDataPath();
@@ -341,6 +349,7 @@ class NebulaStore : public KVStore, public Handler {
   std::shared_ptr<DiskManager> diskMan_;
   folly::ConcurrentHashMap<std::string, std::function<void(std::shared_ptr<Part>&)>>
       onNewPartAdded_;
+  std::function<void(GraphSpaceID)> beforeRemoveSpace_{nullptr};
 };
 
 }  // namespace kvstore

@@ -113,6 +113,8 @@ endif()
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L ${NEBULA_THIRDPARTY_ROOT}/lib")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L ${NEBULA_THIRDPARTY_ROOT}/lib64")
 
+find_package(opentelemetry-cpp CONFIG REQUIRED)
+
 # All thrift libraries
 set(THRIFT_LIBRARIES
     thriftcpp2

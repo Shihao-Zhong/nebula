@@ -35,7 +35,6 @@ namespace kvstore {
 NebulaStore::~NebulaStore() {
   LOG(INFO) << "Cut off the relationship with meta client";
   options_.partMan_.reset();
-  LOG(INFO) << "Stop the raft service...";
   raftService_->stop();
   LOG(INFO) << "Waiting for the raft service stop...";
   raftService_->waitUntilStop();
@@ -216,6 +215,9 @@ void NebulaStore::loadRemoteListenerFromPartManager() {
 }
 
 void NebulaStore::stop() {
+  LOG(INFO) << "Stop the raft service...";
+  raftService_->stop();
+
   for (const auto& space : spaces_) {
     for (const auto& engine : space.second->engines_) {
       engine->stop();
@@ -383,6 +385,10 @@ std::shared_ptr<Part> NebulaStore::newPart(GraphSpaceID spaceId,
 
 void NebulaStore::removeSpace(GraphSpaceID spaceId, bool isListener) {
   folly::RWSpinLock::WriteHolder wh(&lock_);
+  if (beforeRemoveSpace_) {
+    beforeRemoveSpace_(spaceId);
+  }
+
   if (!isListener) {
     auto spaceIt = this->spaces_.find(spaceId);
     if (spaceIt != this->spaces_.end()) {
@@ -535,6 +541,10 @@ void NebulaStore::checkRemoteListeners(GraphSpaceID spaceId,
       }
     }
   }
+}
+
+void NebulaStore::fetchDiskParts(SpaceDiskPartsMap& diskParts) {
+  diskMan_->getDiskParts(diskParts);
 }
 
 void NebulaStore::updateSpaceOption(GraphSpaceID spaceId,

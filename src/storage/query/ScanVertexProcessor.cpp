@@ -5,6 +5,8 @@
 
 #include "storage/query/ScanVertexProcessor.h"
 
+#include <limits>
+
 #include "common/utils/NebulaKeyUtils.h"
 #include "storage/StorageFlags.h"
 #include "storage/exec/QueryUtils.h"
@@ -24,7 +26,8 @@ void ScanVertexProcessor::process(const cpp2::ScanVertexRequest& req) {
 
 void ScanVertexProcessor::doProcess(const cpp2::ScanVertexRequest& req) {
   spaceId_ = req.get_space_id();
-  limit_ = req.get_limit();
+  // negative limit number means no limit
+  limit_ = req.get_limit() < 0 ? std::numeric_limits<int64_t>::max() : req.get_limit();
   enableReadFollower_ = req.get_enable_read_from_follower();
 
   auto retCode = getSpaceVidLen(spaceId_);
@@ -65,6 +68,13 @@ nebula::cpp2::ErrorCode ScanVertexProcessor::checkAndBuildContexts(
   std::vector<cpp2::VertexProp> returnProps = *req.return_columns_ref();
   ret = handleVertexProps(returnProps);
   buildTagColName(returnProps);
+  ret = buildFilter(req, [](const cpp2::ScanVertexRequest& r) -> const std::string* {
+    if (r.filter_ref().has_value()) {
+      return r.get_filter();
+    } else {
+      return nullptr;
+    }
+  });
   return ret;
 }
 
@@ -80,21 +90,22 @@ void ScanVertexProcessor::buildTagColName(const std::vector<cpp2::VertexProp>& t
 }
 
 void ScanVertexProcessor::onProcessFinished() {
-  resp_.set_vertex_data(std::move(resultDataSet_));
+  resp_.set_props(std::move(resultDataSet_));
   resp_.set_cursors(std::move(cursors_));
 }
 
 StoragePlan<Cursor> ScanVertexProcessor::buildPlan(
     RuntimeContext* context,
     nebula::DataSet* result,
-    std::unordered_map<PartitionID, cpp2::ScanCursor>* cursors) {
+    std::unordered_map<PartitionID, cpp2::ScanCursor>* cursors,
+    StorageExpressionContext* expCtx) {
   StoragePlan<Cursor> plan;
   std::vector<std::unique_ptr<TagNode>> tags;
   for (const auto& tc : tagContext_.propContexts_) {
     tags.emplace_back(std::make_unique<TagNode>(context, &tagContext_, tc.first, &tc.second));
   }
   auto output = std::make_unique<ScanVertexPropNode>(
-      context, std::move(tags), enableReadFollower_, limit_, cursors, result);
+      context, std::move(tags), enableReadFollower_, limit_, cursors, result, expCtx, filter_);
 
   plan.addNode(std::move(output));
   return plan;
@@ -105,28 +116,32 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> ScanVertexProcess
     nebula::DataSet* result,
     std::unordered_map<PartitionID, cpp2::ScanCursor>* cursorsOfPart,
     PartitionID partId,
-    Cursor cursor) {
-  return folly::via(executor_,
-                    [this, context, result, cursorsOfPart, partId, input = std::move(cursor)]() {
-                      auto plan = buildPlan(context, result, cursorsOfPart);
+    Cursor cursor,
+    StorageExpressionContext* expCtx) {
+  return folly::via(
+      executor_,
+      [this, context, result, cursorsOfPart, partId, input = std::move(cursor), expCtx]() {
+        auto plan = buildPlan(context, result, cursorsOfPart, expCtx);
 
-                      auto ret = plan.go(partId, input);
-                      if (ret != nebula::cpp2::ErrorCode::SUCCEEDED) {
-                        return std::make_pair(ret, partId);
-                      }
-                      return std::make_pair(nebula::cpp2::ErrorCode::SUCCEEDED, partId);
-                    });
+        auto ret = plan.go(partId, input);
+        if (ret != nebula::cpp2::ErrorCode::SUCCEEDED) {
+          return std::make_pair(ret, partId);
+        }
+        return std::make_pair(nebula::cpp2::ErrorCode::SUCCEEDED, partId);
+      });
 }
 
 void ScanVertexProcessor::runInSingleThread(const cpp2::ScanVertexRequest& req) {
   contexts_.emplace_back(RuntimeContext(planContext_.get()));
+  expCtxs_.emplace_back(StorageExpressionContext(spaceVidLen_, isIntId_));
   std::unordered_set<PartitionID> failedParts;
-  auto plan = buildPlan(&contexts_.front(), &resultDataSet_, &cursors_);
+  auto plan = buildPlan(&contexts_.front(), &resultDataSet_, &cursors_, &expCtxs_.front());
   for (const auto& partEntry : req.get_parts()) {
     auto partId = partEntry.first;
     auto cursor = partEntry.second;
 
-    auto ret = plan.go(partId, cursor.get_has_next() ? *cursor.get_next_cursor() : "");
+    auto ret = plan.go(
+        partId, cursor.next_cursor_ref().has_value() ? cursor.next_cursor_ref().value() : "");
     if (ret != nebula::cpp2::ErrorCode::SUCCEEDED &&
         failedParts.find(partId) == failedParts.end()) {
       failedParts.emplace(partId);
@@ -143,15 +158,18 @@ void ScanVertexProcessor::runInMultipleThread(const cpp2::ScanVertexRequest& req
     nebula::DataSet result = resultDataSet_;
     results_.emplace_back(std::move(result));
     contexts_.emplace_back(RuntimeContext(planContext_.get()));
+    expCtxs_.emplace_back(StorageExpressionContext(spaceVidLen_, isIntId_));
   }
   size_t i = 0;
   std::vector<folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>>> futures;
   for (const auto& [partId, cursor] : req.get_parts()) {
-    futures.emplace_back(runInExecutor(&contexts_[i],
-                                       &results_[i],
-                                       &cursorsOfPart_[i],
-                                       partId,
-                                       cursor.get_has_next() ? *cursor.get_next_cursor() : ""));
+    futures.emplace_back(
+        runInExecutor(&contexts_[i],
+                      &results_[i],
+                      &cursorsOfPart_[i],
+                      partId,
+                      cursor.next_cursor_ref().has_value() ? cursor.next_cursor_ref().value() : "",
+                      &expCtxs_[i]));
     i++;
   }
 

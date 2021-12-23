@@ -25,7 +25,8 @@ void ScanEdgeProcessor::process(const cpp2::ScanEdgeRequest& req) {
 void ScanEdgeProcessor::doProcess(const cpp2::ScanEdgeRequest& req) {
   spaceId_ = req.get_space_id();
   enableReadFollower_ = req.get_enable_read_from_follower();
-  limit_ = req.get_limit();
+  // Negative means no limit
+  limit_ = req.get_limit() < 0 ? std::numeric_limits<int64_t>::max() : req.get_limit();
 
   auto retCode = getSpaceVidLen(spaceId_);
   if (retCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
@@ -61,9 +62,16 @@ nebula::cpp2::ErrorCode ScanEdgeProcessor::checkAndBuildContexts(const cpp2::Sca
     return ret;
   }
 
-  std::vector<cpp2::EdgeProp> returnProps = {*req.return_columns_ref()};
+  std::vector<cpp2::EdgeProp> returnProps = *req.return_columns_ref();
   ret = handleEdgeProps(returnProps);
   buildEdgeColName(returnProps);
+  ret = buildFilter(req, [](const cpp2::ScanEdgeRequest& r) -> const std::string* {
+    if (r.filter_ref().has_value()) {
+      return r.get_filter();
+    } else {
+      return nullptr;
+    }
+  });
   return ret;
 }
 
@@ -78,14 +86,15 @@ void ScanEdgeProcessor::buildEdgeColName(const std::vector<cpp2::EdgeProp>& edge
 }
 
 void ScanEdgeProcessor::onProcessFinished() {
-  resp_.set_edge_data(std::move(resultDataSet_));
+  resp_.set_props(std::move(resultDataSet_));
   resp_.set_cursors(std::move(cursors_));
 }
 
 StoragePlan<Cursor> ScanEdgeProcessor::buildPlan(
     RuntimeContext* context,
     nebula::DataSet* result,
-    std::unordered_map<PartitionID, cpp2::ScanCursor>* cursors) {
+    std::unordered_map<PartitionID, cpp2::ScanCursor>* cursors,
+    StorageExpressionContext* expCtx) {
   StoragePlan<Cursor> plan;
   std::vector<std::unique_ptr<FetchEdgeNode>> edges;
   for (const auto& ec : edgeContext_.propContexts_) {
@@ -93,7 +102,7 @@ StoragePlan<Cursor> ScanEdgeProcessor::buildPlan(
         std::make_unique<FetchEdgeNode>(context, &edgeContext_, ec.first, &ec.second));
   }
   auto output = std::make_unique<ScanEdgePropNode>(
-      context, std::move(edges), enableReadFollower_, limit_, cursors, result);
+      context, std::move(edges), enableReadFollower_, limit_, cursors, result, expCtx, filter_);
 
   plan.addNode(std::move(output));
   return plan;
@@ -104,10 +113,11 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> ScanEdgeProcessor
     nebula::DataSet* result,
     std::unordered_map<PartitionID, cpp2::ScanCursor>* cursors,
     PartitionID partId,
-    Cursor cursor) {
+    Cursor cursor,
+    StorageExpressionContext* expCtx) {
   return folly::via(executor_,
-                    [this, context, result, cursors, partId, input = std::move(cursor)]() {
-                      auto plan = buildPlan(context, result, cursors);
+                    [this, context, result, cursors, partId, input = std::move(cursor), expCtx]() {
+                      auto plan = buildPlan(context, result, cursors, expCtx);
 
                       auto ret = plan.go(partId, input);
                       if (ret != nebula::cpp2::ErrorCode::SUCCEEDED) {
@@ -119,13 +129,15 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> ScanEdgeProcessor
 
 void ScanEdgeProcessor::runInSingleThread(const cpp2::ScanEdgeRequest& req) {
   contexts_.emplace_back(RuntimeContext(planContext_.get()));
+  expCtxs_.emplace_back(StorageExpressionContext(spaceVidLen_, isIntId_));
   std::unordered_set<PartitionID> failedParts;
-  auto plan = buildPlan(&contexts_.front(), &resultDataSet_, &cursors_);
+  auto plan = buildPlan(&contexts_.front(), &resultDataSet_, &cursors_, &expCtxs_.front());
   for (const auto& partEntry : req.get_parts()) {
     auto partId = partEntry.first;
     auto cursor = partEntry.second;
 
-    auto ret = plan.go(partId, cursor.get_has_next() ? *cursor.get_next_cursor() : "");
+    auto ret = plan.go(
+        partId, cursor.next_cursor_ref().has_value() ? cursor.next_cursor_ref().value() : "");
     if (ret != nebula::cpp2::ErrorCode::SUCCEEDED &&
         failedParts.find(partId) == failedParts.end()) {
       failedParts.emplace(partId);
@@ -142,15 +154,18 @@ void ScanEdgeProcessor::runInMultipleThread(const cpp2::ScanEdgeRequest& req) {
     nebula::DataSet result = resultDataSet_;
     results_.emplace_back(std::move(result));
     contexts_.emplace_back(RuntimeContext(planContext_.get()));
+    expCtxs_.emplace_back(StorageExpressionContext(spaceVidLen_, isIntId_));
   }
   size_t i = 0;
   std::vector<folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>>> futures;
   for (const auto& [partId, cursor] : req.get_parts()) {
-    futures.emplace_back(runInExecutor(&contexts_[i],
-                                       &results_[i],
-                                       &cursorsOfPart_[i],
-                                       partId,
-                                       cursor.get_has_next() ? *cursor.get_next_cursor() : ""));
+    futures.emplace_back(
+        runInExecutor(&contexts_[i],
+                      &results_[i],
+                      &cursorsOfPart_[i],
+                      partId,
+                      cursor.next_cursor_ref().has_value() ? cursor.next_cursor_ref().value() : "",
+                      &expCtxs_[i]));
     i++;
   }
 
