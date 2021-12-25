@@ -60,13 +60,12 @@ int main(int argc, char *argv[]) {
   std::shared_ptr<opentracing::Tracer> tracer{
       new MockTracer{std::move(options)}};
 
-  auto parent_span = tracer->StartSpan("parent");
-  auto child_span =
-        tracer->StartSpan("childA", {ChildOf(&parent_span->context())});
-  child_span->Finish();
+  auto parent_span = tracer->StartSpan("start graphd");
   parent_span->Finish();
   tracer->Close();
   std::cout << oss.str() << "\n";
+
+
   google::SetVersionString(nebula::versionString());
   if (argc == 1) {
     printHelp(argv[0]);

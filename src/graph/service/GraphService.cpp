@@ -58,7 +58,6 @@ Status GraphService::init(std::shared_ptr<folly::IOThreadPoolExecutor> ioExecuto
   parent_span->Finish();
   tracer->Close();
   LOG(INFO) << oss.str() << "\n";
-  LOG(INFO) << "start init graph service tracing 55" << "\n";
   metaClient_ = std::make_unique<meta::MetaClient>(ioExecutor, std::move(addrs.value()), options);
 
   // load data try 3 time
@@ -154,20 +153,29 @@ folly::Future<ExecutionResponse> GraphService::future_execute(int64_t sessionId,
   std::shared_ptr<opentracing::Tracer> tracer{
       new MockTracer{std::move(traceOptions)}};
 
-  auto parent_span = tracer->StartSpan("test query");
+  auto parent_span = tracer->StartSpan("nql query");
   parent_span->SetTag("query", query);
+  parent_span->SetTag("sessionId", sessionId);
   
+  auto ctx_span = tracer->StartSpan("create query context", {ChildOf(&parent_span->context())});
   auto ctx = std::make_unique<RequestContext<ExecutionResponse>>();
+  
   ctx->setQuery(query);
   ctx->setRunner(getThreadManager());
   ctx->setSessionMgr(sessionManager_.get());
   auto future = ctx->future();
   stats::StatsManager::addValue(kNumQueries);
+  ctx_span->Finish();
+
   // When the sessionId is 0, it means the clients to ping the connection is ok
   if (sessionId == 0) {
     ctx->resp().errorCode = ErrorCode::E_SESSION_INVALID;
     ctx->resp().errorMsg = std::make_unique<std::string>("Invalid session id");
     ctx->finish();
+
+    parent_span->Finish();
+    tracer->Close();
+    LOG(INFO) << oss.str() << "\n";
     return future;
   }
   auto cb = [this, sessionId, ctx = std::move(ctx)](
@@ -177,6 +185,7 @@ folly::Future<ExecutionResponse> GraphService::future_execute(int64_t sessionId,
       ctx->resp().errorCode = ErrorCode::E_SESSION_INVALID;
       ctx->resp().errorMsg.reset(new std::string(folly::stringPrintf(
           "Get sessionId[%ld] failed: %s", sessionId, ret.status().toString().c_str())));
+    
       return ctx->finish();
     }
     auto sessionPtr = std::move(ret).value();
@@ -185,6 +194,7 @@ folly::Future<ExecutionResponse> GraphService::future_execute(int64_t sessionId,
       ctx->resp().errorCode = ErrorCode::E_SESSION_INVALID;
       ctx->resp().errorMsg.reset(
           new std::string(folly::stringPrintf("SessionId[%ld] does not exist", sessionId)));
+      
       return ctx->finish();
     }
     ctx->setSession(std::move(sessionPtr));
@@ -195,7 +205,6 @@ folly::Future<ExecutionResponse> GraphService::future_execute(int64_t sessionId,
   parent_span->Finish();
   tracer->Close();
   LOG(INFO) << oss.str() << "\n";
-  LOG(INFO) << "start query end" << "\n";
 
   return future;
 }
